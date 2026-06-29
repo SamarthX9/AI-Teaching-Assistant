@@ -1,5 +1,6 @@
 # app.py
 import os
+from openai import OpenAI
 import json
 import sqlite3
 import numpy as np
@@ -28,6 +29,11 @@ MAX_RESULTS = 10  # Increased to get more context
 load_dotenv()
 MAX_CONTEXT_CHUNKS = 4  # Increased number of chunks per source
 API_KEY = os.getenv("API_KEY")  # Get API key from environment variable
+
+client = OpenAI(
+    api_key=API_KEY.replace("Bearer ", "") if API_KEY else None,
+    base_url="https://aipipe.org/openai/v1"
+)
 
 # Models
 class QueryRequest(BaseModel):
@@ -137,50 +143,19 @@ def cosine_similarity(vec1, vec2):
 # Function to get embedding from aipipe proxy with retry mechanism
 async def get_embedding(text, max_retries=3):
     if not API_KEY:
-        error_msg = "API_KEY environment variable not set"
-        logger.error(error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
-    
-    retries = 0
-    while retries < max_retries:
-        try:
-            logger.info(f"Getting embedding for text (length: {len(text)})")
-            # Call the embedding API through aipipe proxy
-            url = "https://aipipe.org/openai/v1/embeddings"
-            headers = {
-                "Authorization": API_KEY,
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "text-embedding-3-small",
-                "input": text
-            }
-            
-            logger.info("Sending request to embedding API")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        logger.info("Successfully received embedding")
-                        return result["data"][0]["embedding"]
-                    elif response.status == 429:  # Rate limit error
-                        error_text = await response.text()
-                        logger.warning(f"Rate limit reached, retrying after delay (retry {retries+1}): {error_text}")
-                        await asyncio.sleep(5 * (retries + 1))  # Exponential backoff
-                        retries += 1
-                    else:
-                        error_text = await response.text()
-                        error_msg = f"Error getting embedding (status {response.status}): {error_text}"
-                        logger.error(error_msg)
-                        raise HTTPException(status_code=response.status, detail=error_msg)
-        except Exception as e:
-            error_msg = f"Exception getting embedding (attempt {retries+1}/{max_retries}): {e}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
-            retries += 1
-            if retries >= max_retries:
-                raise HTTPException(status_code=500, detail=error_msg)
-            await asyncio.sleep(3 * retries)  # Wait before retry
+        raise HTTPException(status_code=500, detail="API_KEY not found")
+
+    try:
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text
+        )
+
+        return response.data[0].embedding
+
+    except Exception as e:
+        logger.error(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Function to find similar content in the database with improved logic
 async def find_similar_content(query_embedding, conn):
@@ -388,145 +363,65 @@ async def enrich_with_adjacent_chunks(conn, results):
         raise
 
 # Function to generate an answer using LLM with improved prompt
-async def generate_answer(question, relevant_results, max_retries=2):
-    if not API_KEY:
-        error_msg = "API_KEY environment variable not set"
-        logger.error(error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
-    
-    retries = 0
-    while retries < max_retries:    
-        try:
-            logger.info(f"Generating answer for question: '{question[:50]}...'")
-            context = ""
-            for result in relevant_results:
-                source_type = "Discourse post" if result["source"] == "discourse" else "Documentation"
-                context += f"\n\n{source_type} (URL: {result['url']}):\n{result['content'][:1500]}"
-            
-            # Prepare improved prompt
-            prompt = f"""Answer the following question based ONLY on the provided context. 
-            If you cannot answer the question based on the context, say "I don't have enough information to answer this question."
-            
-            Context:
-            {context}
-            
-            Question: {question}
-            
-            Return your response in this exact format:
-            1. A comprehensive yet concise answer
-            2. A "Sources:" section that lists the URLs and relevant text snippets you used to answer
-            
-            Sources must be in this exact format:
-            Sources:
-            1. URL: [exact_url_1], Text: [brief quote or description]
-            2. URL: [exact_url_2], Text: [brief quote or description]
-            
-            Make sure the URLs are copied exactly from the context without any changes.
-            """
-            
-            logger.info("Sending request to LLM API")
-            # Call OpenAI API through aipipe proxy
-            url = "https://aipipe.org/openai/v1/chat/completions"
-            headers = {
-                "Authorization": API_KEY,
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant that provides accurate answers based only on the provided context. Always include sources in your response with exact URLs."},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.3  # Lower temperature for more deterministic outputs
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        logger.info("Successfully received answer from LLM")
-                        return result["choices"][0]["message"]["content"]
-                    elif response.status == 429:  # Rate limit error
-                        error_text = await response.text()
-                        logger.warning(f"Rate limit reached, retrying after delay (retry {retries+1}): {error_text}")
-                        await asyncio.sleep(3 * (retries + 1))  # Exponential backoff
-                        retries += 1
-                    else:
-                        error_text = await response.text()
-                        error_msg = f"Error generating answer (status {response.status}): {error_text}"
-                        logger.error(error_msg)
-                        raise HTTPException(status_code=response.status, detail=error_msg)
-        except Exception as e:
-            error_msg = f"Exception generating answer: {e}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
-            retries += 1
-            if retries >= max_retries:
-                raise HTTPException(status_code=500, detail=error_msg)
-            await asyncio.sleep(2)  # Wait before retry
+async def generate_answer(question, relevant_results):
+
+    context = ""
+
+    for result in relevant_results:
+        source = "Discourse" if result["source"] == "discourse" else "Documentation"
+
+        context += f"""
+
+{source}
+URL: {result['url']}
+
+{result['content'][:1500]}
+"""
+
+    prompt = f"""
+Answer ONLY using the provided context.
+
+Context:
+{context}
+
+Question:
+{question}
+
+At the end include
+
+Sources:
+
+URL:
+Text:
+"""
+
+    try:
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Answer only using the provided context."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+
+        return response.choices[0].message.content
+
+    except Exception as e:
+
+        logger.error(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Function to process multimodal content (text + image)
 async def process_multimodal_query(question, image_base64):
-    if not API_KEY:
-        error_msg = "API_KEY environment variable not set"
-        logger.error(error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
-        
-    try:
-        logger.info(f"Processing query: '{question[:50]}...', image provided: {image_base64 is not None}")
-        if not image_base64:
-            logger.info("No image provided, processing as text-only query")
-            return await get_embedding(question)
-        
-        logger.info("Processing multimodal query with image")
-        # Call the GPT-4o Vision API to process the image and question
-        url = "https://aipipe.org/openai/v1/chat/completions"
-        headers = {
-            "Authorization": API_KEY,
-            "Content-Type": "application/json"
-        }
-        
-        # Format the image for the API
-        image_content = f"data:image/jpeg;base64,{image_base64}"
-        
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"Look at this image and tell me what you see related to this question: {question}"},
-                        {"type": "image_url", "image_url": {"url": image_content}}
-                    ]
-                }
-            ]
-        }
-        
-        logger.info("Sending request to Vision API")
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    image_description = result["choices"][0]["message"]["content"]
-                    logger.info(f"Received image description: '{image_description[:50]}...'")
-                    
-                    # Combine the original question with the image description
-                    combined_query = f"{question}\nImage context: {image_description}"
-                    
-                    # Get embedding for the combined query
-                    return await get_embedding(combined_query)
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Error processing image (status {response.status}): {error_text}")
-                    # Fall back to text-only query
-                    logger.info("Falling back to text-only query")
-                    return await get_embedding(question)
-    except Exception as e:
-        logger.error(f"Exception processing multimodal query: {e}")
-        logger.error(traceback.format_exc())
-        # Fall back to text-only query
-        logger.info("Falling back to text-only query due to exception")
-        return await get_embedding(question)
+    return await get_embedding(question)
 
 # Function to parse LLM response and extract answer and sources with improved reliability
 def parse_llm_response(response):
